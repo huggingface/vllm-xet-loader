@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Zero-copy model loader: xet CAS -> pinned memory -> GPU tensors.
 
-Downloads safetensors shards via hf_xet.download_to_buffer directly into
-pinned host memory, then yields tensors for GPU loading. Bypasses disk entirely.
+Downloads safetensors shards via hf_xet directly into pinned host memory,
+then yields tensors for GPU loading. Bypasses disk entirely.
 
-Uses byte-range requests to download tensors in chunks (~512 MB), keeping
-peak pinned memory bounded regardless of shard size.
+Uses a thread pool to download multiple tensors in parallel, each into its
+own pinned buffer. Peak pinned memory is bounded to N_WORKERS * largest tensor.
 
 Usage:
     vllm serve model_id --load-format hf_zerocopy
@@ -14,6 +14,7 @@ import json
 import os
 import struct
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import torch
@@ -45,9 +46,6 @@ DTYPE_MAP = {
     "I8": (torch.int8, 1),
     "U8": (torch.uint8, 1),
 }
-
-# Maximum bytes to download per range request. Controls peak pinned memory.
-DEFAULT_CHUNK_BYTES = 512 * 1024 * 1024  # 512 MB
 
 
 def _get_hf_token() -> str | None:
@@ -136,20 +134,44 @@ def _download_header(xet_hash, file_size, cas_url, cas_token, cas_exp):
     return metadata, header_total
 
 
-def _yield_tensors_by_range(
-    xet_hash, file_size, cas_url, cas_token, cas_exp,
-    max_chunk_bytes=DEFAULT_CHUNK_BYTES,
-):
-    """Download and yield tensors in bounded-memory chunks via byte-range requests.
+_DOWNLOAD_WORKERS = int(os.environ.get("HF_ZEROCOPY_WORKERS", "16"))
 
-    1. Downloads the safetensors header (small range request)
-    2. Groups contiguous tensors into chunks of ~max_chunk_bytes
-    3. Downloads each chunk, yields tensors, frees the pinned buffer
 
-    Peak pinned memory: ~max_chunk_bytes (default 512 MB).
-    """
+def _download_one_tensor(xet_hash, file_size, cas_url, cas_token, cas_exp,
+                         data_offset, name, info):
+    """Download a single tensor into a pinned buffer. Returns (name, tensor)."""
     import hf_xet
 
+    dtype_str = info["dtype"]
+    if dtype_str not in DTYPE_MAP:
+        raise ValueError(f"Unsupported dtype: {dtype_str}")
+    torch_dtype, elem_size = DTYPE_MAP[dtype_str]
+    start, end = info["data_offsets"]
+    tensor_bytes = end - start
+    count = tensor_bytes // elem_size
+
+    buf = torch.empty(tensor_bytes, dtype=torch.uint8, pin_memory=True)
+    hf_xet.download_to_buffer(
+        hash=xet_hash, file_size=file_size,
+        buf_ptr=buf.data_ptr(), buf_len=tensor_bytes,
+        endpoint=cas_url, token_info=(cas_token, cas_exp),
+        token_refresher=None,
+        byte_range=(data_offset + start, data_offset + end),
+    )
+
+    tensor = torch.frombuffer(
+        buf.numpy(), dtype=torch_dtype, count=count
+    ).reshape(info["shape"])
+    return name, tensor
+
+
+def _yield_tensors(xet_hash, file_size, cas_url, cas_token, cas_exp):
+    """Download tensors in parallel via per-tensor byte-range requests.
+
+    Uses a thread pool to issue concurrent CAS requests. Each tensor gets its
+    own pinned buffer. Futures are yielded in submission order to preserve
+    sequential tensor ordering for model.load_weights().
+    """
     metadata, data_offset = _download_header(
         xet_hash, file_size, cas_url, cas_token, cas_exp
     )
@@ -163,85 +185,33 @@ def _yield_tensors_by_range(
     if not tensors:
         return
 
-    # Group contiguous tensors into chunks
-    chunks = []
-    chunk_tensors = [tensors[0]]
-    chunk_start = tensors[0][1]["data_offsets"][0]
-    chunk_end = tensors[0][1]["data_offsets"][1]
-
-    for name, info in tensors[1:]:
-        start, end = info["data_offsets"]
-        if (end - chunk_start) > max_chunk_bytes:
-            chunks.append((chunk_start, chunk_end, chunk_tensors))
-            chunk_tensors = []
-            chunk_start = start
-        chunk_tensors.append((name, info))
-        chunk_end = end
-
-    chunks.append((chunk_start, chunk_end, chunk_tensors))
-
-    max_chunk_actual = max((end - start) for start, end, _ in chunks)
-    if max_chunk_actual > max_chunk_bytes:
-        logger.warning(
-            "Shard has tensor(s) larger than chunk limit (%.0f MB > %.0f MB); "
-            "peak pinned memory will be bounded by the largest tensor.",
-            max_chunk_actual / 1e6, max_chunk_bytes / 1e6,
-        )
-
+    n_workers = min(_DOWNLOAD_WORKERS, len(tensors))
     logger.info(
-        "Shard: %d tensors in %d chunk(s) (max %.0f MB each)",
-        len(tensors), len(chunks), max_chunk_bytes / 1e6,
+        "Shard: %d tensors (parallel download, %d workers)",
+        len(tensors), n_workers,
     )
 
-    # Download and yield each chunk
-    for chunk_start, chunk_end, chunk_tensors in chunks:
-        chunk_size = chunk_end - chunk_start
-        buf = torch.empty(chunk_size, dtype=torch.uint8, pin_memory=True)
-
-        t0 = time.perf_counter()
-        hf_xet.download_to_buffer(
-            hash=xet_hash, file_size=file_size,
-            buf_ptr=buf.data_ptr(), buf_len=chunk_size,
-            endpoint=cas_url, token_info=(cas_token, cas_exp),
-            token_refresher=None,
-            byte_range=(data_offset + chunk_start, data_offset + chunk_end),
-        )
-        dt = time.perf_counter() - t0
-        logger.debug(
-            "Chunk [%d:%d] (%.1f MB, %d tensors) downloaded in %.2fs",
-            chunk_start, chunk_end, chunk_size / 1e6, len(chunk_tensors), dt,
-        )
-
-        buf_np = buf.numpy()
-        for name, info in chunk_tensors:
-            dtype_str = info["dtype"]
-            if dtype_str not in DTYPE_MAP:
-                raise ValueError(f"Unsupported dtype: {dtype_str}")
-            torch_dtype, elem_size = DTYPE_MAP[dtype_str]
-            start, end = info["data_offsets"]
-            count = (end - start) // elem_size
-            local_offset = start - chunk_start
-            # clone() to decouple tensor lifetime from chunk buffer.
-            # Without this, the caller's reference to the last yielded tensor
-            # prevents freeing the chunk buffer when the next chunk is allocated.
-            tensor = torch.frombuffer(
-                buf_np, dtype=torch_dtype, offset=local_offset, count=count
-            ).reshape(info["shape"]).clone()
-            yield name, tensor
-
-        del buf_np, buf
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [
+            pool.submit(
+                _download_one_tensor, xet_hash, file_size,
+                cas_url, cas_token, cas_exp, data_offset, name, info,
+            )
+            for name, info in tensors
+        ]
+        for fut in futures:
+            yield fut.result()
 
 
 class ZeroCopyModelLoader(BaseModelLoader):
     """Model loader that downloads directly into pinned memory via xet CAS.
 
-    Bypasses disk entirely. Uses hf_xet.download_to_buffer with byte-range
-    requests to download safetensors tensors in bounded-memory chunks
-    (~512 MB), then yields tensors for GPU loading via DMA.
+    Bypasses disk entirely. Downloads tensors in parallel via byte-range
+    requests into pinned buffers, then yields for GPU loading via DMA.
 
     Key optimizations:
-    - Bounded memory: downloads tensors in chunks, not full shards
-    - Zero-copy: CAS data lands directly in pinned memory, DMA to GPU
+    - Parallel per-tensor downloads: N concurrent CAS requests via thread pool
+    - Per-tensor buffers: peak pinned memory = N_workers * largest tensor
     - Zero disk I/O: data goes network -> pinned RAM -> GPU
     """
 
@@ -274,7 +244,7 @@ class ZeroCopyModelLoader(BaseModelLoader):
             for filename, file_size, xet_hash in shards:
                 logger.info("Loading %s (%.2f GB)...", filename, file_size / 1e9)
                 t_shard = time.perf_counter()
-                yield from _yield_tensors_by_range(
+                yield from _yield_tensors(
                     xet_hash, file_size, cas_url, cas_token, cas_exp,
                 )
                 dt = time.perf_counter() - t_shard

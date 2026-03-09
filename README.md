@@ -5,20 +5,19 @@ A vLLM model loader that downloads safetensors weights via xet CAS directly into
 ## How it works
 
 1. Resolves xet hashes and CAS token from Hub API
-2. Allocates pinned host memory (`torch.empty(pin_memory=True)`)
-3. Downloads shards via `hf_xet.download_to_buffer` (single CAS roundtrip, parallel xorb block fetches)
-4. Parses safetensors headers in-place and yields `torch.frombuffer` tensors
-5. GPU loads tensors via DMA from pinned memory
+2. Parses safetensors headers via small byte-range requests
+3. Downloads each tensor individually in parallel (thread pool) via `hf_xet.download_to_buffer` byte-range requests into pinned host memory
+4. Yields `torch.frombuffer` tensors for GPU loading via DMA
 
-Key optimizations:
-- **Prefetch**: first shard download starts before model architecture initialization
-- **Pipelining**: shard N+1 downloads while shard N's tensors are being consumed
-- **Single CAS roundtrip**: all file terms resolved at once (no adaptive prefetch overhead)
+Key properties:
+- **Parallel per-tensor downloads**: 16 concurrent CAS byte-range requests (configurable via `HF_ZEROCOPY_WORKERS`)
+- **Server-side trimming**: CAS server trims responses at chunk granularity, so only needed data is transferred
 - **Zero disk I/O**: data goes network -> pinned RAM -> GPU
+- **Bounded memory**: peak pinned memory = N_workers * largest tensor size
 
 ## Requirements
 
-- `hf_xet` with `download_to_buffer` support (xet-core PR #688)
+- `hf_xet` with `download_to_buffer` byte-range support (xet-core PR #688)
 - CUDA GPU
 - `vllm` v0.8+
 
@@ -43,18 +42,21 @@ Then copy `zerocopy_loader.py` into `vllm/model_executor/model_loader/`.
 vllm serve Qwen/Qwen2.5-7B-Instruct --load-format hf_zerocopy --enforce-eager
 ```
 
-## Benchmarks (g5.2xlarge A10G, us-east-1)
+## Benchmarks
 
-### Qwen2.5-7B-Instruct (4 shards, 15.2 GB)
+### Per-tensor download (SmolLM2-1.7B, 1 shard 3.42 GB, g5.2xlarge A10G, us-east-1)
+
+10 runs each, median reported:
+
+| Method | Time | Speedup |
+|---|---|---|
+| hf_hub download + safetensors load | 30.51s | 1.0x |
+| Zero-copy parallel (8 workers) | 4.05s | 7.5x |
+| **Zero-copy parallel (16 workers)** | **3.67s** | **8.3x** |
+
+### End-to-end vLLM TTFT (Qwen2.5-7B-Instruct, 4 shards 15.2 GB)
 
 | Path | TTFT | Speedup |
 |---|---|---|
 | Standard (xet -> disk -> load) | 43.0s | 1x |
 | **Zero-copy (xet -> pinned mem -> DMA)** | **16.0s** | **2.7x** |
-
-### SmolLM2-1.7B (1 shard, 3.4 GB)
-
-| Path | TTFT | Speedup |
-|---|---|---|
-| Standard (xet -> disk -> load) | 12.0s | 1x |
-| **Zero-copy (xet -> pinned mem -> DMA)** | **5.75s** | **2.1x** |
