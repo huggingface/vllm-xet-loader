@@ -209,9 +209,11 @@ def _yield_tensors_by_range(
             start, end = info["data_offsets"]
             count = (end - start) // elem_size
             local_offset = start - chunk_start
+            # clone() so each tensor owns its memory independently,
+            # allowing the chunk buffer to be freed immediately after.
             tensor = torch.frombuffer(
                 buf_np, dtype=torch_dtype, offset=local_offset, count=count
-            ).reshape(info["shape"])
+            ).reshape(info["shape"]).clone()
             yield name, tensor
 
         del buf_np, buf
