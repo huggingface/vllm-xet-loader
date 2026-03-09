@@ -162,12 +162,20 @@ def _download_shard(
         result.done.set()
 
 
-def _yield_tensors_from_shard(buf: torch.Tensor, file_size: int):
-    """Parse safetensors header and yield (name, tensor) from pinned buffer."""
+def _yield_tensors_from_shard(
+    buf: torch.Tensor, file_size: int, chunk_size_mb: int = 500
+):
+    """Parse safetensors header and yield (name, tensor) from pinned buffer.
+
+    For tensors larger than chunk_size_mb, copy them immediately to avoid
+    holding the entire pinned buffer until all tensors are consumed.
+    This reduces peak memory usage at the cost of one extra copy for large tensors.
+    """
     buf_np = buf.numpy()
     header_len = struct.unpack("<Q", buf_np[:8].tobytes())[0]
     metadata = json.loads(buf_np[8 : 8 + header_len].tobytes())
     data_offset = 8 + header_len
+    chunk_size_bytes = chunk_size_mb * 1024 * 1024
 
     for name, info in metadata.items():
         if name == "__metadata__":
@@ -177,10 +185,18 @@ def _yield_tensors_from_shard(buf: torch.Tensor, file_size: int):
             raise ValueError(f"Unsupported dtype: {dtype_str}")
         torch_dtype, elem_size = DTYPE_MAP[dtype_str]
         start, end = info["data_offsets"]
-        count = (end - start) // elem_size
+        tensor_size_bytes = end - start
+        count = tensor_size_bytes // elem_size
+
+        # Create tensor view from pinned buffer
         tensor = torch.frombuffer(
             buf_np, dtype=torch_dtype, offset=data_offset + start, count=count
         ).reshape(info["shape"])
+
+        # For large tensors, copy to regular memory to allow pinned buffer freeing
+        if tensor_size_bytes > chunk_size_bytes:
+            tensor = tensor.detach().clone()
+
         yield name, tensor
 
 
@@ -208,6 +224,10 @@ class ZeroCopyModelLoader(BaseModelLoader):
         self._cas_exp: int | None = None
         self._first_shard: _ShardResult | None = None
 
+        # Tensor chunking config: copy large tensors to regular memory to free
+        # pinned buffer sooner. Set via ZET_TENSOR_CHUNK_MB env var.
+        self._tensor_chunk_mb = int(os.environ.get("ZET_TENSOR_CHUNK_MB", "500"))
+
     def download_model(self, model_config: ModelConfig) -> None:
         pass
 
@@ -228,9 +248,10 @@ class ZeroCopyModelLoader(BaseModelLoader):
 
         total_gb = sum(s for _, s, _ in self._shards) / 1e9
         logger.info(
-            "Zero-copy (xet): %d shard(s), %.2f GB total",
+            "Zero-copy (xet): %d shard(s), %.2f GB total, tensor chunk threshold: %d MB",
             len(self._shards),
             total_gb,
+            self._tensor_chunk_mb,
         )
 
         if not self._shards:
@@ -305,7 +326,9 @@ class ZeroCopyModelLoader(BaseModelLoader):
                     t.start()
 
                 # Yield tensors from current shard
-                yield from _yield_tensors_from_shard(pending.buf, pending.file_size)
+                yield from _yield_tensors_from_shard(
+                    pending.buf, pending.file_size, chunk_size_mb=self._tensor_chunk_mb
+                )
 
                 # Free pinned buffer
                 del pending.buf
