@@ -10,10 +10,12 @@ own pinned buffer. Peak pinned memory is bounded to N_WORKERS * largest tensor.
 Usage:
     vllm serve model_id --load-format hf_zerocopy
 """
+import itertools
 import json
 import os
 import struct
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -168,9 +170,9 @@ def _download_one_tensor(xet_hash, file_size, cas_url, cas_token, cas_exp,
 def _yield_tensors(xet_hash, file_size, cas_url, cas_token, cas_exp):
     """Download tensors in parallel via per-tensor byte-range requests.
 
-    Uses a thread pool to issue concurrent CAS requests. Each tensor gets its
-    own pinned buffer. Futures are yielded in submission order to preserve
-    sequential tensor ordering for model.load_weights().
+    Uses a sliding window of futures to bound peak pinned memory. The prefetch
+    window is 4x the worker count, which benchmarks show matches submit-all
+    throughput while capping in-flight buffers.
     """
     metadata, data_offset = _download_header(
         xet_hash, file_size, cas_url, cas_token, cas_exp
@@ -186,21 +188,34 @@ def _yield_tensors(xet_hash, file_size, cas_url, cas_token, cas_exp):
         return
 
     n_workers = min(_DOWNLOAD_WORKERS, len(tensors))
+    prefetch = min(n_workers * 4, len(tensors))
     logger.info(
-        "Shard: %d tensors (parallel download, %d workers)",
-        len(tensors), n_workers,
+        "Shard: %d tensors (parallel download, %d workers, prefetch %d)",
+        len(tensors), n_workers, prefetch,
     )
 
+    def _submit(pool, name, info):
+        return pool.submit(
+            _download_one_tensor, xet_hash, file_size,
+            cas_url, cas_token, cas_exp, data_offset, name, info,
+        )
+
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = [
-            pool.submit(
-                _download_one_tensor, xet_hash, file_size,
-                cas_url, cas_token, cas_exp, data_offset, name, info,
-            )
-            for name, info in tensors
-        ]
-        for fut in futures:
-            yield fut.result()
+        it = iter(tensors)
+        pending = deque()
+
+        # Prefill the window
+        for name, info in itertools.islice(it, prefetch):
+            pending.append(_submit(pool, name, info))
+
+        # Yield completed, refill from remaining
+        for name, info in it:
+            yield pending.popleft().result()
+            pending.append(_submit(pool, name, info))
+
+        # Drain
+        while pending:
+            yield pending.popleft().result()
 
 
 class ZeroCopyModelLoader(BaseModelLoader):
@@ -211,7 +226,7 @@ class ZeroCopyModelLoader(BaseModelLoader):
 
     Key optimizations:
     - Parallel per-tensor downloads: N concurrent CAS requests via thread pool
-    - Per-tensor buffers: peak pinned memory = N_workers * largest tensor
+    - Sliding window prefetch: bounds in-flight pinned buffers to 4x workers
     - Zero disk I/O: data goes network -> pinned RAM -> GPU
     """
 
