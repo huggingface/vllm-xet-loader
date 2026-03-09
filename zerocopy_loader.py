@@ -23,6 +23,7 @@ from torch import nn
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
@@ -186,6 +187,7 @@ def _yield_tensors_from_shard(buf: torch.Tensor, file_size: int):
         yield name, tensor
 
 
+@register_model_loader("hf_zerocopy")
 class ZeroCopyModelLoader(BaseModelLoader):
     """Model loader that downloads directly into pinned memory via xet CAS.
 
