@@ -13,8 +13,6 @@ import os
 import struct
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import requests
 import torch
 from huggingface_hub import HfApi
@@ -23,7 +21,6 @@ from torch import nn
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
@@ -187,7 +184,6 @@ def _yield_tensors_from_shard(buf: torch.Tensor, file_size: int):
         yield name, tensor
 
 
-@register_model_loader("hf_zerocopy")
 class ZeroCopyModelLoader(BaseModelLoader):
     """Model loader that downloads directly into pinned memory via xet CAS.
 
@@ -368,3 +364,10 @@ class ZeroCopyModelLoader(BaseModelLoader):
             process_weights_after_loading(model, model_config, target_device)
 
         return model.eval()
+
+
+# Late registration to avoid circular import when this file is placed inside
+# vllm/model_executor/model_loader/
+from vllm.model_executor.model_loader import register_model_loader  # noqa: E402
+
+register_model_loader("hf_zerocopy")(ZeroCopyModelLoader)
