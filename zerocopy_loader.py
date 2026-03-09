@@ -118,6 +118,10 @@ def _download_header(xet_hash, file_size, cas_url, cas_token, cas_exp):
         token_refresher=None, byte_range=(0, 8),
     )
     header_len = struct.unpack("<Q", size_buf.numpy().tobytes())[0]
+    if header_len > file_size - 8:
+        raise ValueError(
+            f"Safetensors header ({header_len}B) exceeds file size ({file_size}B)"
+        )
 
     # Download full header
     header_total = 8 + header_len
@@ -176,6 +180,14 @@ def _yield_tensors_by_range(
 
     chunks.append((chunk_start, chunk_end, chunk_tensors))
 
+    max_chunk_actual = max((end - start) for start, end, _ in chunks)
+    if max_chunk_actual > max_chunk_bytes:
+        logger.warning(
+            "Shard has tensor(s) larger than chunk limit (%.0f MB > %.0f MB); "
+            "peak pinned memory will be bounded by the largest tensor.",
+            max_chunk_actual / 1e6, max_chunk_bytes / 1e6,
+        )
+
     logger.info(
         "Shard: %d tensors in %d chunk(s) (max %.0f MB each)",
         len(tensors), len(chunks), max_chunk_bytes / 1e6,
@@ -209,8 +221,9 @@ def _yield_tensors_by_range(
             start, end = info["data_offsets"]
             count = (end - start) // elem_size
             local_offset = start - chunk_start
-            # clone() so each tensor owns its memory independently,
-            # allowing the chunk buffer to be freed immediately after.
+            # clone() to decouple tensor lifetime from chunk buffer.
+            # Without this, the caller's reference to the last yielded tensor
+            # prevents freeing the chunk buffer when the next chunk is allocated.
             tensor = torch.frombuffer(
                 buf_np, dtype=torch_dtype, offset=local_offset, count=count
             ).reshape(info["shape"]).clone()
