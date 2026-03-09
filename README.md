@@ -43,9 +43,18 @@ Then copy `zerocopy_loader.py` into `vllm/model_executor/model_loader/`.
 vllm serve Qwen/Qwen2.5-7B-Instruct --load-format hf_zerocopy --enforce-eager
 ```
 
-## Benchmark (SmolLM2-1.7B, 3.4 GB, g5.xlarge A10G)
+## Benchmarks (g5.2xlarge A10G, us-east-1)
 
-| Path | Median TTFT | Speedup |
+### Qwen2.5-7B-Instruct (4 shards, 15.2 GB)
+
+| Path | TTFT | Speedup |
 |---|---|---|
-| Standard (xet -> disk -> load) | 12.00s | 1x |
+| Standard (xet -> disk -> load) | 43.0s | 1x |
+| **Zero-copy (xet -> pinned mem -> DMA)** | **16.0s** | **2.7x** |
+
+### SmolLM2-1.7B (1 shard, 3.4 GB)
+
+| Path | TTFT | Speedup |
+|---|---|---|
+| Standard (xet -> disk -> load) | 12.0s | 1x |
 | **Zero-copy (xet -> pinned mem -> DMA)** | **5.75s** | **2.1x** |
