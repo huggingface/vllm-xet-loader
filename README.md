@@ -46,13 +46,13 @@ vllm serve Qwen/Qwen2.5-7B-Instruct --load-format hf_zerocopy --enforce-eager
 
 ### Per-tensor download (SmolLM2-1.7B, 1 shard 3.42 GB, g5.2xlarge A10G, us-east-1)
 
-10 runs each, median reported:
+HF cache on local NVMe SSD for fair comparison:
 
-| Method | Time | Speedup |
-|---|---|---|
-| hf_hub download + safetensors load | 30.51s | 1.0x |
-| Zero-copy parallel (8 workers) | 4.05s | 7.5x |
-| **Zero-copy parallel (16 workers)** | **3.67s** | **8.3x** |
+| Method | Time | GB/s | Speedup |
+|---|---|---|---|
+| hf_hub download + safetensors load (NVMe) | 25.16s | 0.14 | 1.0x |
+| Zero-copy parallel (8 workers) | 4.14s | 0.83 | 6.1x |
+| **Zero-copy parallel (16 workers)** | **3.70s** | **0.92** | **6.8x** |
 
 ### End-to-end vLLM TTFT (Qwen2.5-7B-Instruct, 4 shards 15.2 GB)
 
