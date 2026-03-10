@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import torch
+import torch.distributed as dist
 from huggingface_hub import HfApi
 from torch import nn
 
@@ -218,6 +219,77 @@ def _yield_tensors(xet_hash, file_size, cas_url, cas_token, cas_exp):
             yield pending.popleft().result()
 
 
+def _yield_tensors_tp(xet_hash, file_size, cas_url, cas_token, cas_exp, tp_group):
+    """Multi-GPU: rank 0 downloads tensors, broadcasts to all ranks via gloo.
+
+    All ranks parse the safetensors header (tiny, ~few KB) to know tensor
+    shapes and dtypes. Rank 0 downloads tensor data in parallel (same sliding
+    window as single-GPU), then broadcasts each tensor to other ranks via the
+    gloo CPU process group.
+    """
+    # All ranks parse the header to get tensor metadata
+    metadata, data_offset = _download_header(
+        xet_hash, file_size, cas_url, cas_token, cas_exp
+    )
+
+    tensors = [
+        (name, info) for name, info in metadata.items() if name != "__metadata__"
+    ]
+    tensors.sort(key=lambda x: x[1]["data_offsets"][0])
+
+    if not tensors:
+        return
+
+    tp_rank = tp_group.rank_in_group
+    src_global = tp_group.ranks[0]
+    cpu_group = tp_group.cpu_group
+
+    if tp_rank == 0:
+        n_workers = min(_DOWNLOAD_WORKERS, len(tensors))
+        prefetch = min(n_workers * 4, len(tensors))
+        logger.info(
+            "Shard: %d tensors (rank 0 download, %d workers, broadcast to %d ranks)",
+            len(tensors), n_workers, tp_group.world_size,
+        )
+
+        def _submit(pool, name, info):
+            return pool.submit(
+                _download_one_tensor, xet_hash, file_size,
+                cas_url, cas_token, cas_exp, data_offset, name, info,
+            )
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            it = iter(tensors)
+            pending = deque()
+
+            for name, info in itertools.islice(it, prefetch):
+                pending.append(_submit(pool, name, info))
+
+            for name, info in it:
+                result_name, tensor = pending.popleft().result()
+                dist.broadcast(tensor, src=src_global, group=cpu_group)
+                yield result_name, tensor
+                pending.append(_submit(pool, name, info))
+
+            while pending:
+                result_name, tensor = pending.popleft().result()
+                dist.broadcast(tensor, src=src_global, group=cpu_group)
+                yield result_name, tensor
+    else:
+        logger.info(
+            "Shard: %d tensors (rank %d, receiving from rank 0)",
+            len(tensors), tp_rank,
+        )
+        for name, info in tensors:
+            dtype_str = info["dtype"]
+            if dtype_str not in DTYPE_MAP:
+                raise ValueError(f"Unsupported dtype: {dtype_str}")
+            torch_dtype, _ = DTYPE_MAP[dtype_str]
+            tensor = torch.empty(info["shape"], dtype=torch_dtype, pin_memory=True)
+            dist.broadcast(tensor, src=src_global, group=cpu_group)
+            yield name, tensor
+
+
 class ZeroCopyModelLoader(BaseModelLoader):
     """Model loader that downloads directly into pinned memory via xet CAS.
 
@@ -228,6 +300,7 @@ class ZeroCopyModelLoader(BaseModelLoader):
     - Parallel per-tensor downloads: N concurrent CAS requests via thread pool
     - Sliding window prefetch: bounds in-flight pinned buffers to 4x workers
     - Zero disk I/O: data goes network -> pinned RAM -> GPU
+    - Multi-GPU: rank 0 downloads, broadcasts to other ranks via gloo
     """
 
     def __init__(self, load_config: LoadConfig):
@@ -248,20 +321,38 @@ class ZeroCopyModelLoader(BaseModelLoader):
         )
 
         total_gb = sum(s for _, s, _ in shards) / 1e9
+
+        # Detect tensor parallelism
+        tp_group = None
+        if dist.is_initialized():
+            from vllm.distributed import get_tp_group
+            tp_group = get_tp_group()
+            if tp_group.world_size <= 1:
+                tp_group = None
+
+        tp_info = ""
+        if tp_group is not None:
+            tp_info = f", TP={tp_group.world_size} (rank {tp_group.rank_in_group})"
         logger.info(
-            "Zero-copy (xet): %d shard(s), %.2f GB total",
-            len(shards), total_gb,
+            "Zero-copy (xet): %d shard(s), %.2f GB total%s",
+            len(shards), total_gb, tp_info,
         )
 
         t0 = time.perf_counter()
+        yield_fn = _yield_tensors_tp if tp_group is not None else _yield_tensors
 
         def weights_iter():
             for filename, file_size, xet_hash in shards:
                 logger.info("Loading %s (%.2f GB)...", filename, file_size / 1e9)
                 t_shard = time.perf_counter()
-                yield from _yield_tensors(
-                    xet_hash, file_size, cas_url, cas_token, cas_exp,
-                )
+                if tp_group is not None:
+                    yield from yield_fn(
+                        xet_hash, file_size, cas_url, cas_token, cas_exp, tp_group,
+                    )
+                else:
+                    yield from yield_fn(
+                        xet_hash, file_size, cas_url, cas_token, cas_exp,
+                    )
                 dt = time.perf_counter() - t_shard
                 logger.info(
                     "Loaded %s in %.2fs (%.2f GB/s)",
