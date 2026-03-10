@@ -4,8 +4,12 @@
 Downloads safetensors shards via hf_xet directly into pinned host memory,
 then yields tensors for GPU loading. Bypasses disk entirely.
 
-Uses a thread pool to download multiple tensors in parallel, each into its
-own pinned buffer. Peak pinned memory is bounded to N_WORKERS * largest tensor.
+Uses a thread pool to download multiple tensors in parallel via byte-range
+CAS requests, each into its own pinned buffer.
+
+Multi-GPU (TP > 1): rank 0 downloads all tensors in parallel, broadcasts
+each to other ranks via gloo as they complete. Other ranks download nothing.
+Total CDN bandwidth = 1x model size regardless of TP degree.
 
 Usage:
     vllm serve model_id --load-format hf_zerocopy
@@ -20,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import torch
+import torch.distributed as dist
 from huggingface_hub import HfApi
 from torch import nn
 
@@ -48,6 +53,8 @@ DTYPE_MAP = {
     "I8": (torch.int8, 1),
     "U8": (torch.uint8, 1),
 }
+
+_DOWNLOAD_WORKERS = int(os.environ.get("HF_ZEROCOPY_WORKERS", "16"))
 
 
 def _get_hf_token() -> str | None:
@@ -105,6 +112,10 @@ def _get_shard_info(model_name: str, revision: str | None, token: str | None):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Tensor download helpers
+# ---------------------------------------------------------------------------
+
 def _download_header(xet_hash, file_size, cas_url, cas_token, cas_exp):
     """Download and parse the safetensors header via two small range requests."""
     import hf_xet
@@ -136,12 +147,9 @@ def _download_header(xet_hash, file_size, cas_url, cas_token, cas_exp):
     return metadata, header_total
 
 
-_DOWNLOAD_WORKERS = int(os.environ.get("HF_ZEROCOPY_WORKERS", "16"))
-
-
 def _download_one_tensor(xet_hash, file_size, cas_url, cas_token, cas_exp,
                          data_offset, name, info):
-    """Download a single tensor into a pinned buffer. Returns (name, tensor)."""
+    """Download a single tensor into its own pinned buffer."""
     import hf_xet
 
     dtype_str = info["dtype"]
@@ -149,36 +157,30 @@ def _download_one_tensor(xet_hash, file_size, cas_url, cas_token, cas_exp,
         raise ValueError(f"Unsupported dtype: {dtype_str}")
     torch_dtype, elem_size = DTYPE_MAP[dtype_str]
     start, end = info["data_offsets"]
+    shape = info["shape"]
     tensor_bytes = end - start
-    count = tensor_bytes // elem_size
 
-    buf = torch.empty(tensor_bytes, dtype=torch.uint8, pin_memory=True)
+    tensor = torch.empty(shape, dtype=torch_dtype, pin_memory=True)
     hf_xet.download_to_buffer(
         hash=xet_hash, file_size=file_size,
-        buf_ptr=buf.data_ptr(), buf_len=tensor_bytes,
+        buf_ptr=tensor.data_ptr(), buf_len=tensor_bytes,
         endpoint=cas_url, token_info=(cas_token, cas_exp),
         token_refresher=None,
         byte_range=(data_offset + start, data_offset + end),
     )
-
-    tensor = torch.frombuffer(
-        buf.numpy(), dtype=torch_dtype, count=count
-    ).reshape(info["shape"])
     return name, tensor
 
 
-def _yield_tensors(xet_hash, file_size, cas_url, cas_token, cas_exp):
-    """Download tensors in parallel via per-tensor byte-range requests.
+# ---------------------------------------------------------------------------
+# Tensor yield strategies
+# ---------------------------------------------------------------------------
 
-    Uses a sliding window of futures to bound peak pinned memory. The prefetch
-    window is 4x the worker count, which benchmarks show matches submit-all
-    throughput while capping in-flight buffers.
-    """
+def _yield_tensors(xet_hash, file_size, cas_url, cas_token, cas_exp):
+    """Download all tensors in parallel via thread pool. For TP=1."""
     metadata, data_offset = _download_header(
         xet_hash, file_size, cas_url, cas_token, cas_exp
     )
 
-    # Collect and sort tensors by their byte offset
     tensors = [
         (name, info) for name, info in metadata.items() if name != "__metadata__"
     ]
@@ -190,7 +192,7 @@ def _yield_tensors(xet_hash, file_size, cas_url, cas_token, cas_exp):
     n_workers = min(_DOWNLOAD_WORKERS, len(tensors))
     prefetch = min(n_workers * 4, len(tensors))
     logger.info(
-        "Shard: %d tensors (parallel download, %d workers, prefetch %d)",
+        "Shard: %d tensors (%d workers, prefetch %d)",
         len(tensors), n_workers, prefetch,
     )
 
@@ -204,31 +206,81 @@ def _yield_tensors(xet_hash, file_size, cas_url, cas_token, cas_exp):
         it = iter(tensors)
         pending = deque()
 
-        # Prefill the window
         for name, info in itertools.islice(it, prefetch):
             pending.append(_submit(pool, name, info))
 
-        # Yield completed, refill from remaining
         for name, info in it:
             yield pending.popleft().result()
             pending.append(_submit(pool, name, info))
 
-        # Drain
         while pending:
             yield pending.popleft().result()
+
+
+def _yield_tensors_tp(xet_hash, file_size, cas_url, cas_token, cas_exp,
+                      tp_rank, tp_group):
+    """Rank 0 downloads tensors in parallel, broadcasts via gloo. For TP>1.
+
+    Total CDN bandwidth = 1x model size regardless of TP degree.
+
+    Rank 0 uses a thread pool to download all tensors in parallel. As they
+    complete (in order), each is broadcast to other ranks via gloo. Other
+    ranks download nothing, just receive broadcasts.
+    """
+    src_rank = tp_group.ranks[0]
+    cpu_group = tp_group.cpu_group
+
+    # All ranks download the header (small, ~100KB)
+    metadata, data_offset = _download_header(
+        xet_hash, file_size, cas_url, cas_token, cas_exp
+    )
+
+    tensors = [
+        (name, info) for name, info in metadata.items() if name != "__metadata__"
+    ]
+    tensors.sort(key=lambda x: x[1]["data_offsets"][0])
+
+    if not tensors:
+        return
+
+    n_workers = min(_DOWNLOAD_WORKERS, len(tensors))
+    logger.info("Shard: %d tensors (rank %d)", len(tensors), tp_rank)
+
+    if tp_rank == 0:
+        # Rank 0: download all tensors in parallel, broadcast as they complete
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            # Submit all downloads upfront
+            futures = deque()
+            for name, info in tensors:
+                futures.append(pool.submit(
+                    _download_one_tensor, xet_hash, file_size,
+                    cas_url, cas_token, cas_exp, data_offset, name, info,
+                ))
+
+            # Yield in order, broadcast each to other ranks
+            while futures:
+                tname, tensor = futures.popleft().result()
+                dist.broadcast(tensor, src=src_rank, group=cpu_group)
+                yield tname, tensor
+    else:
+        # Other ranks: receive each tensor via broadcast
+        for name, info in tensors:
+            dtype_str = info["dtype"]
+            torch_dtype, _ = DTYPE_MAP[dtype_str]
+            shape = info["shape"]
+            tensor = torch.empty(shape, dtype=torch_dtype, pin_memory=True)
+            dist.broadcast(tensor, src=src_rank, group=cpu_group)
+            yield name, tensor
 
 
 class ZeroCopyModelLoader(BaseModelLoader):
     """Model loader that downloads directly into pinned memory via xet CAS.
 
-    Bypasses disk entirely. Downloads tensors in parallel via byte-range
-    requests into pinned buffers, then yields for GPU loading via DMA.
+    Downloads tensors in parallel via byte-range CAS requests into pinned
+    buffers, then yields for GPU loading via DMA. No disk I/O.
 
-    Key optimizations:
-    - Parallel per-tensor downloads: N concurrent CAS requests via thread pool
-    - Sliding window prefetch: bounds in-flight pinned buffers to 4x workers
-    - Zero disk I/O: data goes network -> pinned RAM -> GPU
-    - Multi-GPU: each rank downloads independently (no broadcast needed)
+    Multi-GPU: rank 0 downloads in parallel, broadcasts via gloo.
+    Total CDN bandwidth = 1x model regardless of TP degree.
     """
 
     def __init__(self, load_config: LoadConfig):
@@ -249,10 +301,30 @@ class ZeroCopyModelLoader(BaseModelLoader):
         )
 
         total_gb = sum(s for _, s, _ in shards) / 1e9
-        logger.info(
-            "Zero-copy (xet): %d shard(s), %.2f GB total",
-            len(shards), total_gb,
+
+        from vllm.distributed.parallel_state import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
         )
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_world_size = get_tensor_model_parallel_world_size()
+
+        use_tp = tp_world_size > 1
+        tp_group = None
+
+        if use_tp:
+            from vllm.distributed import get_tp_group
+            tp_group = get_tp_group()
+            logger.info(
+                "Zero-copy (xet): %d shard(s), %.2f GB total, "
+                "TP=%d rank=%d (parallel download + broadcast)",
+                len(shards), total_gb, tp_world_size, tp_rank,
+            )
+        else:
+            logger.info(
+                "Zero-copy (xet): %d shard(s), %.2f GB total",
+                len(shards), total_gb,
+            )
 
         t0 = time.perf_counter()
 
@@ -260,9 +332,17 @@ class ZeroCopyModelLoader(BaseModelLoader):
             for filename, file_size, xet_hash in shards:
                 logger.info("Loading %s (%.2f GB)...", filename, file_size / 1e9)
                 t_shard = time.perf_counter()
-                yield from _yield_tensors(
-                    xet_hash, file_size, cas_url, cas_token, cas_exp,
-                )
+
+                if use_tp:
+                    yield from _yield_tensors_tp(
+                        xet_hash, file_size, cas_url, cas_token, cas_exp,
+                        tp_rank, tp_group,
+                    )
+                else:
+                    yield from _yield_tensors(
+                        xet_hash, file_size, cas_url, cas_token, cas_exp,
+                    )
+
                 dt = time.perf_counter() - t_shard
                 logger.info(
                     "Loaded %s in %.2fs (%.2f GB/s)",
