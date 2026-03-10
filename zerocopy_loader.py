@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Zero-copy model loader: xet CAS -> pinned memory -> GPU tensors.
 
-Downloads safetensors shards via hf_xet.download_to_buffer directly into
-pinned host memory, then yields tensors for GPU loading. Bypasses disk entirely.
+Downloads safetensors shards via hf_xet directly into pinned host memory,
+then yields tensors for GPU loading. Bypasses disk entirely.
+
+Uses a thread pool to download multiple tensors in parallel, each into its
+own pinned buffer. Peak pinned memory is bounded to N_WORKERS * largest tensor.
 
 Usage:
     vllm serve model_id --load-format hf_zerocopy
 """
-import ctypes
+import itertools
 import json
 import os
 import struct
-import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+
 import requests
 import torch
 from huggingface_hub import HfApi
@@ -100,216 +105,168 @@ def _get_shard_info(model_name: str, revision: str | None, token: str | None):
     return result
 
 
-def _parse_safetensors_header(buf_addr: int, buf_size: int) -> tuple[dict, int]:
-    header_len = struct.unpack(
-        "<Q", (ctypes.c_char * 8).from_address(buf_addr).raw
-    )[0]
-    if header_len > buf_size - 8:
-        raise ValueError(
-            f"Safetensors header ({header_len}B) exceeds buffer ({buf_size}B)"
-        )
-    header_json = (
-        (ctypes.c_char * header_len).from_address(buf_addr + 8).raw.decode("utf-8")
+def _download_header(xet_hash, file_size, cas_url, cas_token, cas_exp):
+    """Download and parse the safetensors header via two small range requests."""
+    import hf_xet
+
+    # First 8 bytes: header length (little-endian u64)
+    size_buf = torch.empty(8, dtype=torch.uint8, pin_memory=True)
+    hf_xet.download_to_buffer(
+        hash=xet_hash, file_size=file_size,
+        buf_ptr=size_buf.data_ptr(), buf_len=8,
+        endpoint=cas_url, token_info=(cas_token, cas_exp),
+        token_refresher=None, byte_range=(0, 8),
     )
-    return json.loads(header_json), 8 + header_len
-
-
-class _ShardResult:
-    """Holds the result of a background shard download."""
-
-    __slots__ = ("buf", "file_size", "error", "download_time", "done")
-
-    def __init__(self):
-        self.buf: torch.Tensor | None = None
-        self.file_size: int = 0
-        self.error: Exception | None = None
-        self.download_time: float = 0.0
-        self.done = threading.Event()
-
-
-def _download_shard(
-    xet_hash: str,
-    file_size: int,
-    cas_url: str,
-    cas_token: str,
-    cas_exp: int,
-    result: _ShardResult,
-    buf: torch.Tensor | None = None,
-):
-    """Download a shard into pinned memory via hf_xet. Runs in a background thread."""
-    try:
-        import hf_xet
-
-        if buf is None:
-            buf = torch.empty(file_size, dtype=torch.uint8, pin_memory=True)
-        result.buf = buf
-        result.file_size = file_size
-
-        t0 = time.perf_counter()
-        hf_xet.download_to_buffer(
-            hash=xet_hash,
-            file_size=file_size,
-            buf_ptr=buf.data_ptr(),
-            buf_len=file_size,
-            endpoint=cas_url,
-            token_info=(cas_token, cas_exp),
-            token_refresher=None,
+    header_len = struct.unpack("<Q", size_buf.numpy().tobytes())[0]
+    if header_len > file_size - 8:
+        raise ValueError(
+            f"Safetensors header ({header_len}B) exceeds file size ({file_size}B)"
         )
-        result.download_time = time.perf_counter() - t0
-    except Exception as e:
-        result.error = e
-    finally:
-        result.done.set()
+
+    # Download full header
+    header_total = 8 + header_len
+    header_buf = torch.empty(header_total, dtype=torch.uint8, pin_memory=True)
+    hf_xet.download_to_buffer(
+        hash=xet_hash, file_size=file_size,
+        buf_ptr=header_buf.data_ptr(), buf_len=header_total,
+        endpoint=cas_url, token_info=(cas_token, cas_exp),
+        token_refresher=None, byte_range=(0, header_total),
+    )
+    metadata = json.loads(header_buf.numpy()[8:header_total].tobytes())
+    return metadata, header_total
 
 
-def _yield_tensors_from_shard(buf: torch.Tensor, file_size: int):
-    """Parse safetensors header and yield (name, tensor) from pinned buffer."""
-    buf_np = buf.numpy()
-    header_len = struct.unpack("<Q", buf_np[:8].tobytes())[0]
-    metadata = json.loads(buf_np[8 : 8 + header_len].tobytes())
-    data_offset = 8 + header_len
+_DOWNLOAD_WORKERS = int(os.environ.get("HF_ZEROCOPY_WORKERS", "16"))
 
-    for name, info in metadata.items():
-        if name == "__metadata__":
-            continue
-        dtype_str = info["dtype"]
-        if dtype_str not in DTYPE_MAP:
-            raise ValueError(f"Unsupported dtype: {dtype_str}")
-        torch_dtype, elem_size = DTYPE_MAP[dtype_str]
-        start, end = info["data_offsets"]
-        count = (end - start) // elem_size
-        tensor = torch.frombuffer(
-            buf_np, dtype=torch_dtype, offset=data_offset + start, count=count
-        ).reshape(info["shape"])
-        yield name, tensor
+
+def _download_one_tensor(xet_hash, file_size, cas_url, cas_token, cas_exp,
+                         data_offset, name, info):
+    """Download a single tensor into a pinned buffer. Returns (name, tensor)."""
+    import hf_xet
+
+    dtype_str = info["dtype"]
+    if dtype_str not in DTYPE_MAP:
+        raise ValueError(f"Unsupported dtype: {dtype_str}")
+    torch_dtype, elem_size = DTYPE_MAP[dtype_str]
+    start, end = info["data_offsets"]
+    tensor_bytes = end - start
+    count = tensor_bytes // elem_size
+
+    buf = torch.empty(tensor_bytes, dtype=torch.uint8, pin_memory=True)
+    hf_xet.download_to_buffer(
+        hash=xet_hash, file_size=file_size,
+        buf_ptr=buf.data_ptr(), buf_len=tensor_bytes,
+        endpoint=cas_url, token_info=(cas_token, cas_exp),
+        token_refresher=None,
+        byte_range=(data_offset + start, data_offset + end),
+    )
+
+    tensor = torch.frombuffer(
+        buf.numpy(), dtype=torch_dtype, count=count
+    ).reshape(info["shape"])
+    return name, tensor
+
+
+def _yield_tensors(xet_hash, file_size, cas_url, cas_token, cas_exp):
+    """Download tensors in parallel via per-tensor byte-range requests.
+
+    Uses a sliding window of futures to bound peak pinned memory. The prefetch
+    window is 4x the worker count, which benchmarks show matches submit-all
+    throughput while capping in-flight buffers.
+    """
+    metadata, data_offset = _download_header(
+        xet_hash, file_size, cas_url, cas_token, cas_exp
+    )
+
+    # Collect and sort tensors by their byte offset
+    tensors = [
+        (name, info) for name, info in metadata.items() if name != "__metadata__"
+    ]
+    tensors.sort(key=lambda x: x[1]["data_offsets"][0])
+
+    if not tensors:
+        return
+
+    n_workers = min(_DOWNLOAD_WORKERS, len(tensors))
+    prefetch = min(n_workers * 4, len(tensors))
+    logger.info(
+        "Shard: %d tensors (parallel download, %d workers, prefetch %d)",
+        len(tensors), n_workers, prefetch,
+    )
+
+    def _submit(pool, name, info):
+        return pool.submit(
+            _download_one_tensor, xet_hash, file_size,
+            cas_url, cas_token, cas_exp, data_offset, name, info,
+        )
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        it = iter(tensors)
+        pending = deque()
+
+        # Prefill the window
+        for name, info in itertools.islice(it, prefetch):
+            pending.append(_submit(pool, name, info))
+
+        # Yield completed, refill from remaining
+        for name, info in it:
+            yield pending.popleft().result()
+            pending.append(_submit(pool, name, info))
+
+        # Drain
+        while pending:
+            yield pending.popleft().result()
 
 
 class ZeroCopyModelLoader(BaseModelLoader):
     """Model loader that downloads directly into pinned memory via xet CAS.
 
-    Bypasses disk entirely. Uses hf_xet.download_to_buffer to download
-    safetensors shards into pinned host memory, then yields tensors for
-    GPU loading via DMA.
+    Bypasses disk entirely. Downloads tensors in parallel via byte-range
+    requests into pinned buffers, then yields for GPU loading via DMA.
 
     Key optimizations:
-    - Prefetch: first shard download starts before model architecture init
-    - Pipelining: shard N+1 downloads while shard N's tensors are consumed
-    - Zero-copy: CAS data lands directly in pinned memory, DMA to GPU
-    - Single CAS roundtrip per shard for term resolution
+    - Parallel per-tensor downloads: N concurrent CAS requests via thread pool
+    - Sliding window prefetch: bounds in-flight pinned buffers to 4x workers
+    - Zero disk I/O: data goes network -> pinned RAM -> GPU
     """
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
 
-        # Prefetch state
-        self._shards: list[tuple[str, int, str]] | None = None
-        self._cas_url: str | None = None
-        self._cas_token: str | None = None
-        self._cas_exp: int | None = None
-        self._first_shard: _ShardResult | None = None
-
     def download_model(self, model_config: ModelConfig) -> None:
         pass
 
-    def _start_prefetch(self, model_config: ModelConfig):
-        """Resolve shard info, CAS token, and start downloading first shard.
-
-        Called BEFORE initialize_model() so download overlaps with model init.
-        """
-        t0 = time.perf_counter()
+    @instrument(span_name="Load weights (zerocopy-xet)")
+    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         token = _get_hf_token()
         hub_endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
         revision = model_config.revision or "main"
 
-        self._shards = _get_shard_info(model_config.model, revision, token)
-        self._cas_url, self._cas_token, self._cas_exp = _get_cas_token(
+        shards = _get_shard_info(model_config.model, revision, token)
+        cas_url, cas_token, cas_exp = _get_cas_token(
             hub_endpoint, model_config.model, revision, token
         )
 
-        total_gb = sum(s for _, s, _ in self._shards) / 1e9
+        total_gb = sum(s for _, s, _ in shards) / 1e9
         logger.info(
             "Zero-copy (xet): %d shard(s), %.2f GB total",
-            len(self._shards),
-            total_gb,
+            len(shards), total_gb,
         )
-
-        if not self._shards:
-            return
-
-        # Allocate pinned buffer for first shard
-        first_buf = torch.empty(
-            self._shards[0][1], dtype=torch.uint8, pin_memory=True
-        )
-
-        # Start download in background (overlaps with model init)
-        self._first_shard = _ShardResult()
-        t = threading.Thread(
-            target=_download_shard,
-            args=(
-                self._shards[0][2],  # xet_hash
-                self._shards[0][1],  # file_size
-                self._cas_url,
-                self._cas_token,
-                self._cas_exp,
-                self._first_shard,
-                first_buf,
-            ),
-            daemon=True,
-        )
-        t.start()
-
-        dt = time.perf_counter() - t0
-        logger.info("Zero-copy: prefetch started in %.2fs", dt)
-
-    @instrument(span_name="Load weights (zerocopy-xet)")
-    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
-        assert self._shards is not None, "_start_prefetch must be called first"
 
         t0 = time.perf_counter()
 
         def weights_iter():
-            pending = self._first_shard
-
-            for i, (filename, file_size, xet_hash) in enumerate(self._shards):
-                assert pending is not None
-                pending.done.wait()
-                if pending.error:
-                    raise pending.error
-
-                logger.info(
-                    "Downloaded %s (%.2f GB) in %.2fs (%.2f GB/s)",
-                    filename,
-                    pending.file_size / 1e9,
-                    pending.download_time,
-                    pending.file_size / pending.download_time / 1e9
-                    if pending.download_time > 0
-                    else 0,
+            for filename, file_size, xet_hash in shards:
+                logger.info("Loading %s (%.2f GB)...", filename, file_size / 1e9)
+                t_shard = time.perf_counter()
+                yield from _yield_tensors(
+                    xet_hash, file_size, cas_url, cas_token, cas_exp,
                 )
-
-                # Start next shard download in background
-                next_pending = None
-                if i + 1 < len(self._shards):
-                    next_pending = _ShardResult()
-                    t = threading.Thread(
-                        target=_download_shard,
-                        args=(
-                            self._shards[i + 1][2],
-                            self._shards[i + 1][1],
-                            self._cas_url,
-                            self._cas_token,
-                            self._cas_exp,
-                            next_pending,
-                        ),
-                        daemon=True,
-                    )
-                    t.start()
-
-                # Yield tensors from current shard
-                yield from _yield_tensors_from_shard(pending.buf, pending.file_size)
-
-                # Free pinned buffer
-                del pending.buf
-                pending = next_pending
+                dt = time.perf_counter() - t_shard
+                logger.info(
+                    "Loaded %s in %.2fs (%.2f GB/s)",
+                    filename, dt, file_size / dt / 1e9 if dt > 0 else 0,
+                )
 
         loaded_weights = model.load_weights(weights_iter())
         dt = time.perf_counter() - t0
@@ -328,7 +285,6 @@ class ZeroCopyModelLoader(BaseModelLoader):
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
-        """Override load_model to start download BEFORE model architecture init."""
         from vllm.platforms import current_platform
 
         device_config = vllm_config.device_config
@@ -339,10 +295,6 @@ class ZeroCopyModelLoader(BaseModelLoader):
         target_device = torch.device(load_device)
 
         with set_default_torch_dtype(model_config.dtype):
-            # Start download in background FIRST
-            self._start_prefetch(model_config)
-
-            # Then initialize model architecture (download runs concurrently)
             with target_device:
                 model = initialize_model(
                     vllm_config=vllm_config,
@@ -350,7 +302,6 @@ class ZeroCopyModelLoader(BaseModelLoader):
                     prefix=prefix,
                 )
 
-            # Load weights (first shard may already be downloaded)
             self.load_weights(model, model_config)
 
             if current_platform.is_cuda():
