@@ -244,6 +244,25 @@ def _yield_tensors_tp(xet_hash, file_size, cas_url, cas_token, cas_exp, tp_group
     src_global = tp_group.ranks[0]
     cpu_group = tp_group.cpu_group
 
+    # Status byte: 1 = tensor coming, 0 = error (abort)
+    _OK = torch.ones(1, dtype=torch.uint8)
+    _ERR = torch.zeros(1, dtype=torch.uint8)
+
+    def _broadcast_status_ok():
+        status = _OK.clone()
+        dist.broadcast(status, src=src_global, group=cpu_group)
+
+    def _broadcast_status_err(err):
+        status = _ERR.clone()
+        dist.broadcast(status, src=src_global, group=cpu_group)
+        raise err
+
+    def _recv_status():
+        status = torch.empty(1, dtype=torch.uint8)
+        dist.broadcast(status, src=src_global, group=cpu_group)
+        if status.item() == 0:
+            raise RuntimeError("Rank 0 failed during tensor download")
+
     if tp_rank == 0:
         n_workers = min(_DOWNLOAD_WORKERS, len(tensors))
         prefetch = min(n_workers * 4, len(tensors))
@@ -258,6 +277,15 @@ def _yield_tensors_tp(xet_hash, file_size, cas_url, cas_token, cas_exp, tp_group
                 cas_url, cas_token, cas_exp, data_offset, name, info,
             )
 
+        def _broadcast_tensor(future):
+            try:
+                result_name, tensor = future.result()
+            except Exception as e:
+                _broadcast_status_err(e)
+            _broadcast_status_ok()
+            dist.broadcast(tensor, src=src_global, group=cpu_group)
+            return result_name, tensor
+
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             it = iter(tensors)
             pending = deque()
@@ -266,21 +294,18 @@ def _yield_tensors_tp(xet_hash, file_size, cas_url, cas_token, cas_exp, tp_group
                 pending.append(_submit(pool, name, info))
 
             for name, info in it:
-                result_name, tensor = pending.popleft().result()
-                dist.broadcast(tensor, src=src_global, group=cpu_group)
-                yield result_name, tensor
+                yield _broadcast_tensor(pending.popleft())
                 pending.append(_submit(pool, name, info))
 
             while pending:
-                result_name, tensor = pending.popleft().result()
-                dist.broadcast(tensor, src=src_global, group=cpu_group)
-                yield result_name, tensor
+                yield _broadcast_tensor(pending.popleft())
     else:
         logger.info(
             "Shard: %d tensors (rank %d, receiving from rank 0)",
             len(tensors), tp_rank,
         )
         for name, info in tensors:
+            _recv_status()
             dtype_str = info["dtype"]
             if dtype_str not in DTYPE_MAP:
                 raise ValueError(f"Unsupported dtype: {dtype_str}")
