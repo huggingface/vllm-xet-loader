@@ -18,6 +18,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import requests
 import torch
 from huggingface_hub import HfApi
@@ -105,19 +106,11 @@ def _get_shard_info(model_name: str, revision: str | None, token: str | None):
     return result
 
 
-def _download_header(xet_hash, file_size, cas_url, cas_token, cas_exp):
+def _download_header(group, file_info, file_size):
     """Download and parse the safetensors header via two small range requests."""
-    import hf_xet
-
     # First 8 bytes: header length (little-endian u64)
-    size_buf = torch.empty(8, dtype=torch.uint8, pin_memory=True)
-    hf_xet.download_to_buffer(
-        hash=xet_hash, file_size=file_size,
-        buf_ptr=size_buf.data_ptr(), buf_len=8,
-        endpoint=cas_url, token_info=(cas_token, cas_exp),
-        token_refresher=None, byte_range=(0, 8),
-    )
-    header_len = struct.unpack("<Q", size_buf.numpy().tobytes())[0]
+    size_buf = b"".join(group.download_stream(file_info, start=0, end=8))
+    header_len = struct.unpack("<Q", size_buf)[0]
     if header_len > file_size - 8:
         raise ValueError(
             f"Safetensors header ({header_len}B) exceeds file size ({file_size}B)"
@@ -125,25 +118,18 @@ def _download_header(xet_hash, file_size, cas_url, cas_token, cas_exp):
 
     # Download full header
     header_total = 8 + header_len
-    header_buf = torch.empty(header_total, dtype=torch.uint8, pin_memory=True)
-    hf_xet.download_to_buffer(
-        hash=xet_hash, file_size=file_size,
-        buf_ptr=header_buf.data_ptr(), buf_len=header_total,
-        endpoint=cas_url, token_info=(cas_token, cas_exp),
-        token_refresher=None, byte_range=(0, header_total),
+    header_buf = b"".join(
+        group.download_stream(file_info, start=8, end=header_total)
     )
-    metadata = json.loads(header_buf.numpy()[8:header_total].tobytes())
+    metadata = json.loads(header_buf)
     return metadata, header_total
 
 
 _DOWNLOAD_WORKERS = int(os.environ.get("HF_ZEROCOPY_WORKERS", "16"))
 
 
-def _download_one_tensor(xet_hash, file_size, cas_url, cas_token, cas_exp,
-                         data_offset, name, info):
+def _download_one_tensor(group, file_info, data_offset, name, info):
     """Download a single tensor into a pinned buffer. Returns (name, tensor)."""
-    import hf_xet
-
     dtype_str = info["dtype"]
     if dtype_str not in DTYPE_MAP:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
@@ -151,32 +137,42 @@ def _download_one_tensor(xet_hash, file_size, cas_url, cas_token, cas_exp,
     start, end = info["data_offsets"]
     tensor_bytes = end - start
     count = tensor_bytes // elem_size
+    if tensor_bytes == 0:
+        # torch.frombuffer rejects empty buffers.
+        return name, torch.empty(info["shape"], dtype=torch_dtype)
 
     buf = torch.empty(tensor_bytes, dtype=torch.uint8, pin_memory=True)
-    hf_xet.download_to_buffer(
-        hash=xet_hash, file_size=file_size,
-        buf_ptr=buf.data_ptr(), buf_len=tensor_bytes,
-        endpoint=cas_url, token_info=(cas_token, cas_exp),
-        token_refresher=None,
-        byte_range=(data_offset + start, data_offset + end),
-    )
+    buf_np = buf.numpy()
+    received = 0
+    # Chunk offsets are relative to the requested range start, not the file.
+    for offset, chunk in group.download_unordered_stream(
+        file_info, start=data_offset + start, end=data_offset + end
+    ):
+        # numpy releases the GIL for this copy; memoryview assignment does not.
+        buf_np[offset:offset + len(chunk)] = np.frombuffer(chunk, dtype=np.uint8)
+        received += len(chunk)
+    if received != tensor_bytes:
+        raise ValueError(
+            f"{name}: expected {tensor_bytes} bytes, received {received}"
+        )
 
     tensor = torch.frombuffer(
-        buf.numpy(), dtype=torch_dtype, count=count
+        buf_np, dtype=torch_dtype, count=count
     ).reshape(info["shape"])
     return name, tensor
 
 
-def _yield_tensors(xet_hash, file_size, cas_url, cas_token, cas_exp):
+def _yield_tensors(group, xet_hash, file_size):
     """Download tensors in parallel via per-tensor byte-range requests.
 
     Uses a sliding window of futures to bound peak pinned memory. The prefetch
     window is 4x the worker count, which benchmarks show matches submit-all
     throughput while capping in-flight buffers.
     """
-    metadata, data_offset = _download_header(
-        xet_hash, file_size, cas_url, cas_token, cas_exp
-    )
+    import hf_xet
+
+    file_info = hf_xet.XetFileInfo(xet_hash, file_size)
+    metadata, data_offset = _download_header(group, file_info, file_size)
 
     # Collect and sort tensors by their byte offset
     tensors = [
@@ -196,8 +192,7 @@ def _yield_tensors(xet_hash, file_size, cas_url, cas_token, cas_exp):
 
     def _submit(pool, name, info):
         return pool.submit(
-            _download_one_tensor, xet_hash, file_size,
-            cas_url, cas_token, cas_exp, data_offset, name, info,
+            _download_one_tensor, group, file_info, data_offset, name, info,
         )
 
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -238,6 +233,8 @@ class ZeroCopyModelLoader(BaseModelLoader):
 
     @instrument(span_name="Load weights (zerocopy-xet)")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        import hf_xet
+
         token = _get_hf_token()
         hub_endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
         revision = model_config.revision or "main"
@@ -255,20 +252,22 @@ class ZeroCopyModelLoader(BaseModelLoader):
 
         t0 = time.perf_counter()
 
-        def weights_iter():
+        def weights_iter(group):
             for filename, file_size, xet_hash in shards:
                 logger.info("Loading %s (%.2f GB)...", filename, file_size / 1e9)
                 t_shard = time.perf_counter()
-                yield from _yield_tensors(
-                    xet_hash, file_size, cas_url, cas_token, cas_exp,
-                )
+                yield from _yield_tensors(group, xet_hash, file_size)
                 dt = time.perf_counter() - t_shard
                 logger.info(
                     "Loaded %s in %.2fs (%.2f GB/s)",
                     filename, dt, file_size / dt / 1e9 if dt > 0 else 0,
                 )
 
-        loaded_weights = model.load_weights(weights_iter())
+        session = hf_xet.XetSession()
+        with session.new_download_stream_group(
+            endpoint=cas_url, token=cas_token, token_expiry_unix_secs=cas_exp
+        ) as group:
+            loaded_weights = model.load_weights(weights_iter(group))
         dt = time.perf_counter() - t0
         logger.info("Zero-copy weight loading completed in %.2fs", dt)
 
@@ -315,10 +314,3 @@ class ZeroCopyModelLoader(BaseModelLoader):
             process_weights_after_loading(model, model_config, target_device)
 
         return model.eval()
-
-
-# Late registration to avoid circular import when this file is placed inside
-# vllm/model_executor/model_loader/
-from vllm.model_executor.model_loader import register_model_loader  # noqa: E402
-
-register_model_loader("hf_zerocopy")(ZeroCopyModelLoader)
