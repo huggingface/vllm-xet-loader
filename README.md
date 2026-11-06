@@ -6,7 +6,7 @@ A vLLM model loader that downloads safetensors weights via xet CAS directly into
 
 1. Resolves xet hashes and CAS token from Hub API
 2. Parses safetensors headers via small byte-range requests
-3. Downloads each tensor individually in parallel (thread pool) via `hf_xet.download_to_buffer` byte-range requests into pinned host memory
+3. Downloads each tensor individually in parallel (thread pool) via `XetDownloadStreamGroup.download_unordered_stream` byte-range requests into pinned host memory
 4. Yields `torch.frombuffer` tensors for GPU loading via DMA
 
 Key properties:
@@ -17,7 +17,7 @@ Key properties:
 
 ## Requirements
 
-- `hf_xet` with `download_to_buffer` byte-range support (xet-core PR #688)
+- `hf_xet>=1.8.0` (`XetSession` streaming API with byte-range support)
 - CUDA GPU
 - `vllm` v0.8+
 
